@@ -1,0 +1,268 @@
+---
+title: "20240202 gDT panel 1 MNP workspace FlowWorkspace proportion analysis"
+author: "Abbey Figliomeni"
+date: "2024-02-02"
+output: html_document
+---
+
+# Data import and preprocessing
+## Extract flow data (class: gatingset) using cytoML
+```{r, results="hide"}
+source("[cytoML script working directory]")
+
+```
+
+## Check data
+```{r}
+## Check data
+### visualize gating nodes
+gs_get_pop_paths(gs, path="auto")
+plot(gs)
+
+```
+
+# FLOW WORKSPACE: Creating dataframe with cell subset proportions and TF ratios
+```{r}
+flow_df <- pData(gs)  # creating df based on pData (includes all clinical variables)
+flow_df$Panel <- "gDT1"  # append panel to pData
+
+sample_list <- row.names(flow_df)  # row names are IDs
+sample_list
+
+pop_list <- gs_get_pop_paths(gs, path="auto")  # list of gating nodes populations from flowjo
+pop_list
+pop_list <- pop_list[!grepl("Q[0-9]\\:", pop_list)] # remove unnamed quad gates
+pop_list
+
+## compute surface marker percentage of parent ----
+for (s in sample_list){
+  for (p in pop_list){
+    stat <- gh_pop_get_stats(gs[[s]], nodes=p, type="percent")
+    flow_df[s, p] <- stat$percent*100
+  }
+}
+
+## compute relevant marker MFI ----
+MFIlist <- c("CXCR4 BV421", "CD39 BV605",  "CD16 BV711", "CD25 BV785", "HLA-DR Kblue", "CD127 PE-Dazzle595", "CD33 PE", "CD14 PE-Cy5", "CD11b BV510")
+
+for (s in sample_list){
+  for (m in MFIlist){
+    Mono <- gh_pop_get_stats(gs[[s]], nodes ="NotMono", type=pop.MFI, inverse.transform=T)
+    y <- paste("MonoAll", m , "MFI")
+    flow_df[s, y] <- Mono[[m]]
+    
+    cMono <- gh_pop_get_stats(gs[[s]], nodes ="cMono", type=pop.MFI, inverse.transform=T)
+    y <- paste("cMono", m , "MFI")
+    flow_df[s, y] <- cMono[[m]]
+    
+    iMono <- gh_pop_get_stats(gs[[s]], nodes ="iMono", type=pop.MFI, inverse.transform=T)
+    y <- paste("iMono", m , "MFI")
+    flow_df[s, y] <- iMono[[m]]
+    
+    ncMono <- gh_pop_get_stats(gs[[s]], nodes ="ncMono", type=pop.MFI, inverse.transform=T)
+    y <- paste("ncMono", m , "MFI")
+    flow_df[s, y] <- ncMono[[m]]
+    
+    mMDSC <- gh_pop_get_stats(gs[[s]], nodes ="M-MDSCs", type=pop.MFI, inverse.transform=T)
+    y <- paste("mMDSC", m , "MFI")
+    flow_df[s, y] <- mMDSC[[m]]
+  }
+}
+
+```
+
+# Adding myeloid proportions
+* monocyte subsets already as proportions of total monocytes, however need to convert "monocytes all" and "M-MDSC" gates to as percentage of myeloid, rather than as % of HLA-DR+ or HLA-DR-
+```{r}
+# converting to percentage of myeloid CD33+ cells
+flow_df$MoncytesAll_pcMyeloid <- flow_df$MonocytesAll * flow_df$`HLA-DR+`/100 # monocytes
+flow_df$mono_sum_pcMyeloid <- flow_df$NotMono * flow_df$`HLA-DR+`/100  # sum subsets
+flow_df$`M-MDSC_pcMyeloid` <- flow_df$`M-MDSCs` * flow_df$`HLA-DRneg`/100 # M-MDSCs
+
+# percentage of PBMCs
+flow_df$MoncytesAll_pcPBMCs <- flow_df$MoncytesAll * flow_df$`HLA-DR+`/100 * flow_df$`Myeloid cells`/100 * flow_df$LinNeg/100 # monocytes
+flow_df$mono_sum_pcPBMCs <- flow_df$mono_sum_pcMyeloid * flow_df$`Myeloid cells`/100 * flow_df$LinNeg/100
+flow_df$`M-MDSC_pcPBMCs` <- flow_df$`M-MDSCs` * flow_df$`HLA-DRneg`/100 * flow_df$`Myeloid cells`/100 * flow_df$LinNeg/100 # monocytes
+
+# total MDSCs
+flow_df$MDSCall_pcMyeloid <- (flow_df$`M-MDSCs` + flow_df$`MDSC other`) * flow_df$`HLA-DRneg`/100 # M-MDSCs
+
+```
+
+
+
+## Edit dataframe column names
+```{r}
+## Editing colnames of flow DF  ----
+colnames(flow_df)
+flow_df$root <- NULL
+flow_df$LinNeg <- NULL
+colnames(flow_df) <- gsub("\\/", " ", colnames(flow_df))  # substitutes all slashes in node names for spaces
+colnames(flow_df) <- gsub("\\+", "pos", colnames(flow_df))  # substitutes all pluses in node names for "pos"
+colnames(flow_df) <- gsub(" ", "_", colnames(flow_df))  # substitutes all spaces in node names for underscores
+colnames(flow_df) <- gsub("\\-", ".", colnames(flow_df))  # substitutes all dashes in node names for dots
+colnames(flow_df)
+```
+
+
+## Save as CSV
+```{r, warning=F}
+flow_df <- tibble::rownames_to_column(flow_df, "ID")
+
+write.csv(flow_df, "[working directory]", row.names = F)
+```
+
+
+# Statistical analysis
+Staistical workflow:
+* test PD v control for all basic flow metrics
+* IF PD v Control SIGNIFICANT (p < 0.05, no trends), THEN:
+    + correlate with continuous HY and UPDRS scales
+    + correlate with disease duration, GSRS score, dietary scales???
+    + make publication-ready boxplot figure (also do for important non-sig stats such as overall gDT)
+    
+**No** subgrouping as confounds interpretation and doubles up with correlations.
+
+For significant correlations, look into constructing GLMM.
+
+
+## Libraries
+```{r, echo=F, message=F}
+library(rstatix)
+library(dplyr)
+library(ggplot2)
+library(psych)
+library(car)
+library(Hmisc)
+library(corrplot)
+```
+
+
+## Prepare data
+```{r}
+str(flow_df)
+flow_df$Condition <- factor(flow_df$Condition, levels=c("Control", "PD"))
+flow_df$DiseaseDuration <- as.numeric(flow_df$DiseaseDuration)
+flow_df$LEDD <- as.numeric(flow_df$LEDD)
+flow_df$Age <- as.numeric(flow_df$Age)
+flow_df$GSRStotal <- as.numeric(flow_df$GSRStotal)
+flow_df$H_and_Y <- as.numeric(flow_df$H_and_Y)
+flow_df$UPDRS3 <- as.numeric(flow_df$UPDRS3)
+flow_df$AAO <- as.numeric(flow_df$AAO)
+
+
+
+colnames(flow_df)
+gDT_1_stat_list <- colnames(flow_df)[14:length(colnames(flow_df))]  # colnames of columns with flow data
+gDT_1_stat_list
+
+```
+
+## PD v Control
+```{r}
+flow_df_PD <- subset(flow_df, Condition == "PD")
+flow_df_Ctrl <- subset(flow_df, Condition == "Control")
+
+gDT_1_stats <- data.frame(Parameter = NA,  # create empty data frame to deposit stats into below
+                           StatTest=NA,
+                           pValue=NA,
+                           med.mean.PD=NA,
+                           med.mean.HC=NA,
+                           med.mean.FC=NA)
+
+
+for(i in gDT_1_stat_list){
+  pos <- which(gDT_1_stat_list %in% i)
+  gDT_1_stats[pos, "Parameter"] <- i
+  SW_test_PD <- shapiro_test(flow_df_PD, i)
+  SW_test_C <- shapiro_test(flow_df_Ctrl, i)
+  if(SW_test_PD$p<0.05 | SW_test_C$p<0.05){
+    MW <- wilcox.test(flow_df_PD[[i]], flow_df_Ctrl[[i]])
+    gDT_1_stats[pos,"StatTest"] <- "MannWhitneyU"
+    gDT_1_stats[pos, "pValue"] <- MW$p.value
+    gDT_1_stats[pos, "med.mean.HC"] <- median(flow_df_Ctrl[[i]])
+    gDT_1_stats[pos, "med.mean.PD"] <- median(flow_df_PD[[i]])
+    gDT_1_stats[pos, "med.mean.FC"] <- median(flow_df_PD[[i]])/median(flow_df_Ctrl[[i]])
+  } else{
+    TT <- t.test(flow_df_PD[[i]], flow_df_Ctrl[[i]])
+    gDT_1_stats[pos, "StatTest"] <- "Ttest"
+    gDT_1_stats[pos, "pValue"] <- TT$p.value
+    gDT_1_stats[pos, "med.mean.HC"] <- mean(flow_df_Ctrl[[i]])
+    gDT_1_stats[pos, "med.mean.PD"] <- mean(flow_df_PD[[i]])
+    gDT_1_stats[pos, "med.mean.FC"] <- mean(flow_df_PD[[i]])/mean(flow_df_Ctrl[[i]])
+  }
+}
+
+# fixed changed tests 
+changeList <- c(NULL)
+for (x in changeList){
+  pos <- which(gDT_1_stats$Parameter %in% i)
+  if(gDT_1_stats[gDT_1_stats$Parameter==x,]$StatTest=="MannWhitneyU"){
+    TT <- t.test(flow_df_PD[[i]], flow_df_Ctrl[[i]])
+    gDT_1_stats[pos, "StatTest"] <- "Ttest"
+    gDT_1_stats[pos, "pValue"] <- TT$p.value
+    gDT_1_stats[pos, "med.mean.HC"] <- mean(flow_df_Ctrl[[i]])
+    gDT_1_stats[pos, "med.mean.PD"] <- mean(flow_df_PD[[i]])
+    gDT_1_stats[pos, "med.mean.FC"] <- mean(flow_df_PD[[i]])/mean(flow_df_Ctrl[[i]])
+  } else{
+    MW <- wilcox.test(flow_df_PD[[i]], flow_df_Ctrl[[i]])
+    gDT_1_stats[pos,"StatTest"] <- "MannWhitneyU"
+    gDT_1_stats[pos, "pValue"] <- MW$p.value
+    gDT_1_stats[pos, "med.mean.HC"] <- median(flow_df_Ctrl[[i]])
+    gDT_1_stats[pos, "med.mean.PD"] <- median(flow_df_PD[[i]])
+    gDT_1_stats[pos, "med.mean.FC"] <- median(flow_df_PD[[i]])/median(flow_df_Ctrl[[i]])
+  }
+}
+
+```
+
+### Save CSV
+```{r, warning=F}
+write.csv(gDT_1_stats, "20240203 gDT panel 1 MNP PD v Control stats.csv", row.names = F)
+```
+
+
+# Visualise Data
+## PD v Control boxplots 
+```{r, warning=F}
+# creating function to loop through and plot all flow variables by condition
+setwd("[working directory]")
+
+# with points displayed and no box
+customPlot <- function(varName) {
+  
+  p <- flow_df %>% 
+    group_by_("Condition") %>% 
+    select_("Condition",varName) %>% 
+    ggplot(aes_string("Condition",varName)) + 
+    stat_boxplot(geom ='errorbar', width=0.2, lwd=1) +
+    geom_boxplot(show.legend = FALSE, aes(fill=Condition), lwd=0.8, outlier.shape = NA) +
+    geom_jitter(shape=1, position=position_jitter(0.2, seed = 1), size=4) +
+    geom_label( 
+    data=flow_df, # Filter data first
+    position=position_jitter(0.2, seed = 1), aes(label=ID)) +
+    scale_fill_manual(values = c("mediumslateblue", "orange1")) +
+    labs(x="") +
+    theme(axis.text.x = element_text(size=14, colour="black"),
+          axis.text.y = element_text(size=12),
+          axis.title.y = element_text(size=14))
+  filename <- paste0(varName, '.jpeg')
+  ggplot2::ggsave(plot = p, filename = paste0(filename),
+                  width = 2870,
+                  height = 2072,
+                  units = "px") # width 3.6 default, height 5 default
+  
+}
+lapply(gDT_1_stat_list, customPlot)
+
+```
+
+# Significant data - correlations with pData
+"ClinicalSignifFlowCor" function takes inputs: flow dataframe, stats dataframe, and a significance threshold (alpha) and calculates the relevant correlations between clinical variables and any significantly altered flow variables. Output: dataframe containing variables, correlation coefficient (spearman rank), and p-value. NB - ensure relevant clinicial variables are numeric.
+```{r}
+source("FlowWorkspace significant flow variables correlation with pData function.R")
+ClinicalSignifFlowCor(flow_df=flow_df, stats_df=gDT_1_stats, alpha=1)
+write.csv(Clinical_correlations, "[working directory]", row.names = F)
+
+```
+
